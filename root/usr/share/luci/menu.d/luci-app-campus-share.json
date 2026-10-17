@@ -1,0 +1,15 @@
+{
+  "admin/network/campus_share": {
+    "title": "校园网共享",
+    "order": 65,
+    "action": {
+      "type": "view",
+      "path": "campus-share/overview"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-campus-share"
+      ]
+    }
+  }
+}

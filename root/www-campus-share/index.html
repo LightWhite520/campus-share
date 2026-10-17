@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>加入校园网共享</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#e7edf6;background:#0e1624;color-scheme:dark}
+body{margin:0;min-height:100vh;display:grid;place-items:center}
+main{width:min(440px,calc(100% - 64px));background:#182438;border:1px solid #304158;border-radius:20px;padding:28px}
+small{color:#9eb0c9}h1{font-size:26px;margin:12px 0 20px}p{line-height:1.7;color:#bdcbe0}
+button,a.action{display:block;box-sizing:border-box;width:100%;padding:14px;border:0;border-radius:10px;background:#7ae0bd;color:#092b23;text-align:center;font-size:16px;font-weight:650;text-decoration:none;cursor:pointer;margin:14px 0}
+button:disabled{opacity:.5;cursor:wait}.status{padding:14px;border-radius:10px;background:#0e192a;line-height:1.7}
+[hidden]{display:none!important}
+</style>
+<main><small>校园网共享 · 自助接入</small><h1>把你的带宽加入共享</h1>
+<p>领取一个空闲出口，再用自己的校园网账号登录。账号与密码只填写在校园网原认证页面。</p>
+<div class="status" id="status" role="status">正在检查邀请…</div>
+<button id="claim" hidden>领取空闲出口</button>
+<a id="portal" class="action" hidden target="_blank" rel="noopener noreferrer">打开校园网认证页</a>
+<p id="hint">请保持连接当前 Wi-Fi，接入过程中暂时关闭手机移动数据和代理。不要在普通浏览器里另开 6.6.6.6 给其他人认证。</p>
+<small>插件只在出口确认可上网后加入共享。领取后未完成认证的出口会自动释放。</small>
+</main>
+<script>
+'use strict';
+const statusNode=document.getElementById('status'), claimButton=document.getElementById('claim'), portal=document.getElementById('portal');
+const token=new URLSearchParams(location.hash.slice(1)).get('invite')||'';
+const messages={invalid_invite:'邀请链接无效，请向管理员索取新链接。',invite_expired:'邀请已过期，请索取新链接。',invite_used:'这个邀请已被另一台设备使用。',no_free_slot:'暂时没有空闲出口，请联系管理员。',device_already_assigned:'这台设备已分配出口，请使用之前的邀请链接。',device_not_found:'未能识别设备，请确认已连接路由器 Wi-Fi。',owner_mismatch:'请用领取出口时的同一台设备打开。',lan_unavailable:'内网尚未就绪，请稍后再试。',busy:'服务正在处理其他请求，稍后自动重试。'};
+let claimed=false,busy=false,timer;
+async function request(action){
+ const response=await fetch('/cgi-bin/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,token}),cache:'no-store'});
+ const data=await response.json();
+ if(!data.ok)throw new Error(messages[data.error]||'接入暂不可用：'+data.error);
+ return data;
+}
+function show(data){
+ claimButton.hidden=data.phase!=='invitation';
+ portal.hidden=true;
+ if(data.phase==='invitation'){statusNode.textContent='邀请有效，可以领取空闲出口。';return;}
+ claimed=true;
+ if(data.phase==='active'){statusNode.textContent='已认证成功，你的出口正在参与带宽共享。';document.getElementById('hint').textContent='这台设备已固定使用自己的出口。其他设备的流量由路由器分担。';return;}
+ const notes={waiting_for_dhcp:'已为你预留出口，正在获取地址…',waiting_for_link:'已预留出口，正在等待网线链路或地址，请联系管理员确认接线。',login_required:'出口已准备好，请打开校园网认证页登录。'};
+ statusNode.textContent=notes[data.note]||'正在检查校园网连接…';
+ if(data.note==='login_required'){
+  try{const url=new URL(data.portal);if(url.protocol==='http:'){portal.href=url.href;portal.hidden=false;}}catch(e){}
+ }
+}
+async function update(){
+ if(busy)return;busy=true;
+ try{show(await request('status'));}catch(e){statusNode.textContent=e.message;}
+ finally{busy=false;}
+}
+claimButton.onclick=async()=>{
+ if(busy)return;busy=true;claimButton.disabled=true;
+ try{show(await request('claim'));}catch(e){statusNode.textContent=e.message;}
+ finally{busy=false;claimButton.disabled=false;}
+};
+if(!/^[a-f0-9]{48}$/.test(token)){statusNode.textContent='请使用管理员提供的完整邀请链接。';}
+else{update();timer=setInterval(update,4000);}
+</script></html>

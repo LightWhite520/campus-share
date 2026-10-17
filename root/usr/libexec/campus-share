@@ -1,0 +1,429 @@
+#!/bin/sh
+# All public inputs are JSON data, never evaluated as shell code.
+set -f
+# PATH is inherited by isolated tests; uhttpd/procd supply the system path in production.
+umask 077
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /usr/share/libubox/jshn.sh
+
+ROOT="${CS_STATE_DIR:-/etc/campus-share}"
+RUN="${CS_RUN_DIR:-/var/run/campus-share}"
+cfg() {
+	if [ -n "${CS_UCI_DIR:-}" ]; then uci -c "$CS_UCI_DIR" "$@"; else uci "$@"; fi
+}
+opt() { cfg -q get "campus_share.$1.$2"; }
+field() { jsonfilter -i "$1" -e "@.$2" 2>/dev/null; }
+now() { date +%s; }
+valid_id() { case "$1" in ''|*[!a-zA-Z0-9_]*) return 1;; esac; [ "${#1}" -le 32 ]; }
+valid_token() { case "$1" in *[!a-f0-9]*|'') return 1;; esac; [ "${#1}" -eq 48 ]; }
+valid_ip() { echo "$1" | awk -F. 'NF!=4{exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || $i>255 || length($i)>3) exit 1}'; }
+valid_mac() { echo "$1" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; }
+error() { json_init; json_add_boolean ok 0; json_add_string error "$1"; json_dump; exit 0; }
+ok() { json_init; json_add_boolean ok 1; json_dump; }
+slots() { cfg -q show campus_share | sed -n 's/^campus_share\.\([a-zA-Z0-9_]*\)=slot$/\1/p'; }
+slot_config() {
+	SLOT="$1"; valid_id "$SLOT" || return 1
+	[ "$(cfg -q get campus_share.$SLOT)" = slot ] || return 1
+	[ "$(opt "$SLOT" enabled)" = 1 ] || return 1
+	IFACE="$(opt "$SLOT" interface)"; valid_id "$IFACE" || return 1
+	[ "$(cfg -q get network.$IFACE)" = interface ] || return 1
+	[ "$(cfg -q get network.$IFACE.proto)" = dhcp ] || return 1
+	TABLE="$(opt "$SLOT" table)"
+	case "$TABLE" in ''|*[!0-9]*) return 1;; esac
+	[ "$TABLE" -ge 200 ] && [ "$TABLE" -le 239 ] || return 1
+	RULE=$((400 + TABLE)); PROBE_RULE=$((500 + TABLE))
+	MEMBER="cs_$SLOT"; [ "${#MEMBER}" -le 15 ] || return 1
+	POLICY="$(opt main policy)"; valid_id "$POLICY" || return 1
+	[ "$(cfg -q get mwan3.$POLICY)" = policy ] || return 1
+	STATE="$ROOT/slots/$SLOT.json"
+	if [ -f "$STATE" ]; then
+		[ "$(field "$STATE" interface)" = "$IFACE" ] || return 1
+		[ "$(field "$STATE" policy)" = "$POLICY" ] || return 1
+		[ "$(field "$STATE" table)" = "$TABLE" ] || return 1
+	fi
+}
+interface_available() {
+	[ "$(cfg -q get network.$IFACE.auto)" = 0 ] || return 1
+	[ "$(cfg -q get mwan3.$IFACE.enabled)" != 1 ] || return 1
+	# A configured member referencing this interface means another feature owns it.
+	if cfg -q show mwan3 | grep -F ".interface='$IFACE'" >/dev/null; then return 1; fi
+	local other device z n zoned=0
+	device="$(cfg -q get network.$IFACE.device)"
+	[ -n "$device" ] || return 1
+	for other in $(cfg -q show network | sed -n 's/^network\.\([a-zA-Z0-9_]*\)=interface$/\1/p'); do
+		[ "$other" = "$IFACE" ] && continue
+		if [ "$(cfg -q get network.$other.device)" = "$device" ] && [ "$(cfg -q get network.$other.auto)" != 0 ]; then return 1; fi
+	done
+	for z in $(cfg -q show firewall | sed -n 's/^firewall\.\(.*\)=zone$/\1/p'); do
+		[ "$(cfg -q get firewall.$z.masq)" = 1 ] || continue
+		for n in $(cfg -q get firewall.$z.network); do [ "$n" != "$IFACE" ] || zoned=1; done
+	done
+	[ "$zoned" = 1 ]
+}
+is_free() {
+	slot_config "$1" || return 1
+	[ ! -f "$STATE" ] || return 1
+	interface_available
+}
+discover() {
+	local candidate p count=0 id idx table chosen=''
+	POLICY="$(opt main policy)"
+	if [ -z "$POLICY" ]; then
+		for p in $(cfg -q show mwan3 | sed -n 's/^mwan3\.\([a-zA-Z0-9_]*\)=rule$/\1/p'); do
+			[ "$(cfg -q get mwan3.$p.dest_ip)" = 0.0.0.0/0 ] || continue
+			chosen="$(cfg -q get mwan3.$p.use_policy)"
+			[ "$(cfg -q get mwan3.$chosen)" != policy ] || { POLICY="$chosen"; break; }
+		done
+	fi
+	[ "$(cfg -q get mwan3.$POLICY)" = policy ] || error select_policy_first
+	cfg set "campus_share.main.policy=$POLICY"
+	for candidate in $(cfg -q show network | sed -n 's/^network\.\([a-zA-Z0-9_]*\)=interface$/\1/p'); do
+		[ "$(cfg -q get network.$candidate.proto)" = dhcp ] || continue
+		IFACE="$candidate"
+		interface_available || continue
+		cfg -q show campus_share | grep -F ".interface='$IFACE'" >/dev/null && continue
+		idx=1
+		while [ "$idx" -le 39 ]; do
+			id="uplink_$idx"; table=$((200 + idx))
+			if ! cfg -q get campus_share.$id >/dev/null && ! cfg -q show campus_share | grep -F ".table='$table'" >/dev/null && [ -z "$(ip -4 route show table "$table" 2>/dev/null)" ]; then break; fi
+			idx=$((idx+1))
+		done
+		[ "$idx" -le 39 ] || break
+		cfg set "campus_share.$id=slot"
+		cfg set "campus_share.$id.enabled=1"
+		cfg set "campus_share.$id.interface=$candidate"
+		cfg set "campus_share.$id.label=$candidate"
+		cfg set "campus_share.$id.table=$table"
+		count=$((count+1))
+	done
+	cfg commit campus_share
+	json_init; json_add_boolean ok 1; json_add_int imported "$count"; json_dump
+}
+lan_info() {
+	LAN="$(opt main lan_interface)"; valid_id "$LAN" || return 1
+	network_get_device LANDEV "$LAN" || return 1
+	network_get_ipaddr LANIP "$LAN" || return 1
+	LANCIDR="$(ip -4 route show dev "$LANDEV" proto kernel | awk '$1 ~ /\// {print $1;exit}')"
+	[ -n "$LANCIDR" ]
+}
+peer_mac() {
+	ip -4 neigh show dev "$LANDEV" | awk -v a="$1" '$1==a {for(i=1;i<=NF;i++) if($i=="lladdr") {print tolower($(i+1));exit}}'
+}
+save_state() {
+	json_init
+	json_add_string interface "$IFACE"; json_add_string policy "$POLICY"; json_add_int table "$TABLE"
+	json_add_string device_section "${DEVICE_SECTION:-}"; json_add_string old_mac "${OLD_MAC:-}"
+	json_add_string old_clientid "${OLD_CLIENTID:-}"; json_add_string generated_mac "${GENERATED_MAC:-}"
+	json_add_int device_created "${DEVICE_CREATED:-0}"
+	json_add_string owner "$OWNER"; json_add_string ip "$CLIENT"
+	json_add_string phase "$PHASE"; json_add_string token "$TOKEN"
+	json_add_string note "$NOTE"; json_add_int since "$SINCE"
+	json_add_int failures "${FAILURES:-0}"
+	json_dump > "$STATE.new" && mv "$STATE.new" "$STATE"
+}
+load_state() {
+	OWNER="$(field "$STATE" owner)"; CLIENT="$(field "$STATE" ip)"
+	DEVICE_SECTION="$(field "$STATE" device_section)"; OLD_MAC="$(field "$STATE" old_mac)"
+	OLD_CLIENTID="$(field "$STATE" old_clientid)"; GENERATED_MAC="$(field "$STATE" generated_mac)"
+	DEVICE_CREATED="$(field "$STATE" device_created)"
+	PHASE="$(field "$STATE" phase)"; TOKEN="$(field "$STATE" token)"
+	NOTE="$(field "$STATE" note)"; SINCE="$(field "$STATE" since)"
+	FAILURES="$(cat "$RUN/$SLOT.failures" 2>/dev/null || field "$STATE" failures)"; FAILURES="${FAILURES:-0}"
+}
+drop_rule() {
+	while ip -4 rule del pref "$1" 2>/dev/null; do :; done
+}
+detach_routes() {
+	drop_rule "$RULE"; drop_rule "$PROBE_RULE"
+	ip -4 route flush table "$TABLE" 2>/dev/null
+	nft delete table inet "cs_$SLOT" 2>/dev/null
+}
+route_slot() {
+	local dev addr mask gw ownerip subnet
+	network_flush_cache
+	network_get_device dev "$IFACE" || return 1
+	network_get_ipaddr addr "$IFACE" || return 1
+	network_get_gateway gw "$IFACE" || return 1
+	network_get_subnet mask "$IFACE" || return 1
+	subnet="$(ipcalc.sh "$mask" | sed -n 's/^NETWORK=//p')"
+	valid_ip "$subnet" || return 1
+	mask="$subnet/${mask##*/}"
+	# Dedicated tables do not collide with mwan3's numbered tables.
+	ip -4 route replace unreachable default table "$TABLE" metric 32767 || return 1
+	ip -4 route replace "$LANCIDR" dev "$LANDEV" table "$TABLE" || return 1
+	ip -4 route replace "$mask" dev "$dev" src "$addr" table "$TABLE" || return 1
+	ip -4 route replace default via "$gw" dev "$dev" src "$addr" table "$TABLE" metric 10 || return 1
+	if ! ip -4 rule show | grep -F "$PROBE_RULE:" | grep -F "from $addr lookup $TABLE" >/dev/null; then
+		drop_rule "$PROBE_RULE"
+		ip -4 rule add pref "$PROBE_RULE" from "$addr/32" lookup "$TABLE" || return 1
+	fi
+	SOURCE="$addr"
+	# Refresh ownership after DHCP changes, using the MAC from LAN neighbours.
+	ownerip="$(ip -4 neigh show dev "$LANDEV" | awk -v m="$OWNER" 'tolower($0) ~ m {if($0 !~ /FAILED|INCOMPLETE/) {print $1;exit}}')"
+	if valid_ip "$ownerip" && [ "$(peer_mac "$ownerip")" = "$OWNER" ]; then
+		CLIENT="$ownerip"
+		if ! ip -4 rule show | grep -F "$RULE:" | grep -F "from $CLIENT lookup $TABLE" >/dev/null; then
+			drop_rule "$RULE"
+			ip -4 rule add pref "$RULE" from "$CLIENT/32" lookup "$TABLE" || return 1
+		fi
+	else
+		drop_rule "$RULE"
+		CLIENT=''
+	fi
+	# The portal allocator manages IPv4 only. Prevent IPv6 bypass for this owner.
+	nft list table inet "cs_$SLOT" >/dev/null 2>&1 || nft add table inet "cs_$SLOT"
+	nft -f - <<NFT
+flush table inet cs_$SLOT
+add chain inet cs_$SLOT guard { type filter hook forward priority -1; policy accept; }
+add rule inet cs_$SLOT guard iifname "$LANDEV" ether saddr $OWNER meta nfproto ipv6 reject
+NFT
+}
+remove_member() {
+	local changed=0
+	if cfg -q get mwan3.$MEMBER >/dev/null; then
+		cfg -q del_list "mwan3.$POLICY.use_member=$MEMBER"
+		cfg -q delete "mwan3.$MEMBER"
+		cfg -q delete "mwan3.$IFACE"
+		cfg commit mwan3; changed=1
+	fi
+	[ "$changed" = 0 ] || /etc/init.d/mwan3 reload >/dev/null 2>&1
+}
+add_member() {
+	cfg -q get mwan3.$MEMBER >/dev/null && return 0
+	cfg set "mwan3.$IFACE=interface"
+	cfg set "mwan3.$IFACE.enabled=1"
+	cfg set "mwan3.$IFACE.family=ipv4"
+	cfg set "mwan3.$IFACE.initial_state=online"
+	cfg set "mwan3.$IFACE.track_method=ping"
+	cfg add_list "mwan3.$IFACE.track_ip=223.5.5.5"
+	cfg add_list "mwan3.$IFACE.track_ip=119.29.29.29"
+	cfg set "mwan3.$IFACE.reliability=1"
+	cfg set "mwan3.$IFACE.interval=10"
+	cfg set "mwan3.$IFACE.down=3"
+	cfg set "mwan3.$IFACE.up=3"
+	cfg set "mwan3.$MEMBER=member"
+	cfg set "mwan3.$MEMBER.interface=$IFACE"
+	cfg set "mwan3.$MEMBER.metric=1"
+	cfg set "mwan3.$MEMBER.weight=1"
+	cfg add_list "mwan3.$POLICY.use_member=$MEMBER"
+	cfg commit mwan3
+	/etc/init.d/mwan3 reload >/dev/null 2>&1
+}
+prepare_identity() {
+	local device entry random
+	device="$(cfg -q get network.$IFACE.device)"
+	[ -n "$device" ] || error device_missing
+	DEVICE_SECTION=''; DEVICE_CREATED=0
+	for entry in $(cfg -q show network | sed -n 's/^network\.\(.*\)=device$/\1/p'); do
+		if [ "$(cfg -q get network.$entry.name)" = "$device" ]; then DEVICE_SECTION="$entry"; break; fi
+	done
+	if [ -z "$DEVICE_SECTION" ]; then
+		DEVICE_SECTION="csdev_$SLOT"; DEVICE_CREATED=1
+		cfg -q get "network.$DEVICE_SECTION" >/dev/null && error device_section_conflict
+	fi
+	OLD_MAC="$(cfg -q get network.$DEVICE_SECTION.macaddr)"
+	OLD_CLIENTID="$(cfg -q get network.$IFACE.clientid)"
+	random="$(head -c5 /dev/urandom | hexdump -v -e '/1 ":%02x"')"
+	GENERATED_MAC="02$random"
+	valid_mac "$GENERATED_MAC" || error random_failed
+}
+apply_identity() {
+	if [ "$DEVICE_CREATED" = 1 ]; then
+		cfg set "network.$DEVICE_SECTION=device"
+		cfg set "network.$DEVICE_SECTION.name=$(cfg -q get network.$IFACE.device)"
+	fi
+	cfg set "network.$DEVICE_SECTION.macaddr=$GENERATED_MAC"
+	cfg set "network.$IFACE.clientid=01$(echo "$GENERATED_MAC" | tr -d :)"
+}
+restore_identity() {
+	[ -n "$DEVICE_SECTION" ] || return 0
+	if [ "$DEVICE_CREATED" = 1 ]; then
+		cfg -q delete "network.$DEVICE_SECTION"
+	elif [ -n "$OLD_MAC" ]; then
+		cfg set "network.$DEVICE_SECTION.macaddr=$OLD_MAC"
+	else
+		cfg -q delete "network.$DEVICE_SECTION.macaddr" || :
+	fi
+	if [ -n "$OLD_CLIENTID" ]; then
+		cfg set "network.$IFACE.clientid=$OLD_CLIENTID"
+	else
+		cfg -q delete "network.$IFACE.clientid" || :
+	fi
+}
+release_slot() {
+	slot_config "$1" || error invalid_slot
+	[ -f "$STATE" ] || return 0
+	load_state
+	remove_member
+	detach_routes
+	ifdown "$IFACE" >/dev/null 2>&1
+	restore_identity
+	cfg set "network.$IFACE.auto=0"; cfg commit network
+	campus-share-network-reload >/dev/null 2>&1
+	valid_token "$TOKEN" && rm -f "$ROOT/invites/$TOKEN.json"
+	rm -f "$STATE" "$RUN/$SLOT.failures"
+}
+emit_slot() {
+	json_add_object ''
+	json_add_string id "$SLOT"; json_add_string interface "$IFACE"
+	json_add_string label "$(opt "$SLOT" label)"
+	if [ -f "$STATE" ]; then
+		json_add_string phase "$(field "$STATE" phase)"
+		json_add_string owner "$(field "$STATE" owner)"
+		json_add_string ip "$(field "$STATE" ip)"
+		json_add_string note "$(field "$STATE" note)"
+	else
+		json_add_string phase "$(is_free "$SLOT" && echo free || echo unavailable)"
+	fi
+	json_close_object
+}
+admin_status() {
+	json_init; json_add_boolean ok 1
+	json_add_string policy "$(opt main policy)"
+	json_add_string join_url "http://$LANIP:$(opt main port)/"
+	json_add_array slots
+	for s in $(slots); do slot_config "$s" && emit_slot; done
+	json_close_array; json_dump
+}
+invite() {
+	local token expiry
+	token="$(head -c24 /dev/urandom | hexdump -v -e '/1 "%02x"')"
+	valid_token "$token" || error random_failed
+	expiry=$(($(now) + $(opt main invite_timeout)))
+	json_init; json_add_int expires "$expiry"; json_dump > "$ROOT/invites/$token.json"
+	json_init; json_add_boolean ok 1
+	json_add_string url "http://$LANIP:$(opt main port)/#invite=$token"
+	json_add_int expires "$expiry"; json_dump
+}
+claim() {
+	local s chosen existing slotfile
+	local requested_client="$CLIENT" requested_owner="$OWNER" requested_token="$TOKEN"
+	[ -f "$ROOT/invites/$TOKEN.json" ] || error invalid_invite
+	existing="$(field "$ROOT/invites/$TOKEN.json" slot)"
+	if [ -n "$existing" ]; then
+		slot_config "$existing" || error invalid_slot
+		[ -f "$STATE" ] && [ "$(field "$STATE" owner)" = "$OWNER" ] || error invite_used
+		return 0
+	fi
+	[ "$(field "$ROOT/invites/$TOKEN.json" expires)" -gt "$(now)" ] || error invite_expired
+	# Each device can occupy at most one interface, even using several invitations.
+	for s in $(slots); do
+		slotfile="$ROOT/slots/$s.json"
+		[ ! -f "$slotfile" ] || [ "$(field "$slotfile" owner)" != "$OWNER" ] || error device_already_assigned
+	done
+	chosen=''
+	for s in $(slots); do if is_free "$s"; then chosen="$s"; break; fi; done
+	[ -n "$chosen" ] || error no_free_slot
+	slot_config "$chosen" || error invalid_slot
+	CLIENT="$requested_client"; OWNER="$requested_owner"; TOKEN="$requested_token"
+	# Refuse to overwrite routes/rules belonging to other software.
+	[ -z "$(ip -4 route show table "$TABLE" 2>/dev/null)" ] || error routing_table_in_use
+	[ -z "$(ip -4 rule show | awk -v a="$RULE:" -v b="$PROBE_RULE:" '$1==a || $1==b')" ] || error routing_priority_in_use
+	[ -z "$(cfg changes network)" ] || error uncommitted_network_changes
+	prepare_identity
+	PHASE=pending; NOTE=waiting_for_dhcp; SINCE="$(now)"; FAILURES=0
+	save_state
+	json_init; json_add_string slot "$SLOT"; json_dump > "$ROOT/invites/$TOKEN.json"
+	apply_identity
+	cfg set "network.$IFACE.auto=1"; cfg commit network
+	campus-share-network-reload >/dev/null 2>&1
+	# Quarantine this client's Internet traffic until the selected uplink is ready.
+	ip -4 route add unreachable default table "$TABLE" metric 32767
+	ip -4 route add "$LANCIDR" dev "$LANDEV" table "$TABLE"
+	ip -4 rule add pref "$RULE" from "$CLIENT/32" lookup "$TABLE"
+	ifup "$IFACE" >/dev/null 2>&1
+	for proto in tcp udp; do
+		for port in 80 443; do conntrack -D -s "$CLIENT" -p "$proto" --dport "$port" >/dev/null 2>&1; done
+	done
+}
+public_status() {
+	local assigned
+	assigned="$(field "$ROOT/invites/$TOKEN.json" slot)"
+	[ -n "$assigned" ] || {
+		json_init; json_add_boolean ok 1; json_add_string phase invitation; json_dump; return
+	}
+	slot_config "$assigned" || error invalid_slot
+	[ -f "$STATE" ] && [ "$(field "$STATE" owner)" = "$OWNER" ] || error owner_mismatch
+	json_init; json_add_boolean ok 1
+	json_add_string phase "$(field "$STATE" phase)"
+	json_add_string note "$(field "$STATE" note)"
+	json_add_string interface "$IFACE"
+	json_add_string portal "$(opt main portal_url)"
+	json_dump
+}
+public_request() {
+	local input action
+	input="$(cat)"
+	[ "${#input}" -le 2048 ] || error request_too_large
+	json_load "$input" || error invalid_json
+	json_get_var TOKEN token; json_get_var CLIENT client; json_get_var action action
+	valid_token "$TOKEN" && valid_ip "$CLIENT" || error invalid_request
+	OWNER="$(peer_mac "$CLIENT")"; valid_mac "$OWNER" || error device_not_found
+	[ -f "$ROOT/invites/$TOKEN.json" ] || error invalid_invite
+	case "$action" in
+		claim) claim; public_status;;
+		status) public_status;;
+		*) error invalid_action;;
+	esac
+}
+tick() {
+	local s stamp phase_before client_before
+	for s in $(slots); do
+		slot_config "$s" || continue
+		[ -f "$STATE" ] || continue
+		load_state
+		valid_mac "$OWNER" && valid_token "$TOKEN" || continue
+		stamp="$(now)"
+		if [ "$PHASE" != active ] && [ $((stamp - SINCE)) -gt "$(opt main pending_timeout)" ]; then
+			release_slot "$s"; continue
+		fi
+		phase_before="$PHASE"; client_before="$CLIENT"
+		if route_slot; then
+			if [ "$(curl -4 --interface "$SOURCE" --connect-timeout 2 --max-time 4 -s "$(opt main probe_url)")" = "$(opt main probe_body)" ]; then
+				add_member
+				PHASE=active; NOTE=sharing; FAILURES=0
+			else
+				FAILURES=$((FAILURES + 1))
+				if [ "$PHASE" != active ] || [ "$FAILURES" -ge 3 ]; then
+					remove_member
+					[ "$PHASE" != active ] || SINCE="$stamp"
+					PHASE=pending; NOTE=login_required
+				fi
+			fi
+		else
+			remove_member
+			[ "$PHASE" != active ] || SINCE="$stamp"
+			PHASE=pending; NOTE=waiting_for_link
+		fi
+		echo "$FAILURES" > "$RUN/$s.failures"
+		# Persist transitions, not every polling iteration (reduces flash writes).
+		if [ "$phase_before" != "$PHASE" ] || [ "$client_before" != "$CLIENT" ] || [ "$(field "$STATE" note)" != "$NOTE" ]; then
+			save_state
+
+		fi
+	done
+	# Prune unused expired invitation links.
+	for f in "$ROOT/invites/"*.json; do
+		[ -f "$f" ] || continue
+		[ -n "$(field "$f" slot)" ] && continue
+		[ "$(field "$f" expires)" -ge "$(now)" ] 2>/dev/null || rm -f "$f"
+	done
+}
+[ "${CS_LIBRARY_ONLY:-0}" = 1 ] && return 0
+mkdir -p "$ROOT/slots" "$ROOT/invites" "$RUN"
+lan_info || error lan_unavailable
+[ "$(opt main enabled)" = 1 ] || error disabled
+case "$1" in
+	status) admin_status; exit;;
+esac
+exec 9>"$RUN/lock"
+flock -n 9 || error busy
+case "$1" in
+	invite) invite;;
+	discover) discover;;
+	release) release_slot "$2"; ok;;
+	request) public_request;;
+	tick) tick;;
+	*) error invalid_command;;
+esac

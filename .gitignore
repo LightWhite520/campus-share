@@ -1,0 +1,20 @@
+# Private router state and credentials
+.env
+.env.*
+*.key
+*.pem
+*.pcap
+*.tar
+*.tar.gz
+backups/
+state/
+secrets/
+# Build and local tools
+build/
+dist/
+node_modules/
+__pycache__/
+*.pyc
+
+# Local verification records
+VALIDATION.md

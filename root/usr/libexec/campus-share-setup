@@ -1,0 +1,52 @@
+#!/bin/sh
+set -e
+BACKUP="/root/campus-share-setup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP"
+cp -p /etc/config/uhttpd /etc/config/firewall "$BACKUP/"
+. /lib/functions.sh
+. /lib/functions/network.sh
+LAN="$(uci -q get campus_share.main.lan_interface)"
+network_get_ipaddr LANIP "$LAN" || { echo 'LAN has no IPv4 address'; exit 1; }
+PORT="$(uci -q get campus_share.main.port)"
+case "$PORT" in ''|*[!0-9]*) echo 'Invalid port'; exit 1;; esac
+[ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || exit 1
+# Resolve the firewall zone by interface membership, never by a fixed zone name.
+ZONE=''
+for z in $(uci show firewall | sed -n 's/^firewall\.\(.*\)=zone$/\1/p'); do
+	for n in $(uci -q get "firewall.$z.network"); do
+		[ "$n" != "$LAN" ] || ZONE="$(uci -q get "firewall.$z.name")"
+	done
+done
+[ -n "$ZONE" ] || { echo 'LAN firewall zone not found'; exit 1; }
+uci set uhttpd.campus_share=uhttpd
+uci set "uhttpd.campus_share.listen_http=$LANIP:$PORT"
+uci set uhttpd.campus_share.home=/www-campus-share
+uci set uhttpd.campus_share.cgi_prefix=/cgi-bin
+uci set uhttpd.campus_share.rfc1918_filter=1
+uci set uhttpd.campus_share.script_timeout=15
+uci set uhttpd.campus_share.network_timeout=15
+uci set uhttpd.campus_share.max_requests=4
+uci set uhttpd.campus_share.max_connections=20
+uci set firewall.campus_share_lan=rule
+uci set firewall.campus_share_lan.name=Allow-LAN-Campus-Share
+uci set "firewall.campus_share_lan.src=$ZONE"
+uci set firewall.campus_share_lan.proto=tcp
+uci set "firewall.campus_share_lan.dest_port=$PORT"
+uci set firewall.campus_share_lan.family=ipv4
+uci set firewall.campus_share_lan.target=ACCEPT
+if ! fw4 check; then
+	uci revert firewall; uci revert uhttpd
+	echo "Firewall validation failed; existing configuration retained. Backup: $BACKUP"; exit 1
+fi
+uci commit uhttpd
+uci commit firewall
+/etc/init.d/firewall reload
+/etc/init.d/uhttpd reload
+/etc/init.d/rpcd restart
+/etc/init.d/campus-share enable
+/etc/init.d/campus-share restart
+# Clear only LuCI's generated cache.
+rm -f /tmp/luci-indexcache
+for p in /tmp/luci-indexcache.*; do [ ! -f "$p" ] || rm -f "$p"; done
+echo "Configured. No interface has been activated."
+echo "LuCI: /cgi-bin/luci/admin/network/campus_share"

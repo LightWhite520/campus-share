@@ -1,0 +1,43 @@
+{
+  "luci-app-campus-share": {
+    "description": "Manage invited campus uplink sharing",
+    "read": {
+      "uci": [
+        "campus_share",
+        "network",
+        "mwan3"
+      ],
+      "ubus": {
+        "file": [
+          "exec"
+        ]
+      },
+      "file": {
+        "/usr/libexec/campus-share status": [
+          "exec"
+        ]
+      }
+    },
+    "write": {
+      "uci": [
+        "campus_share"
+      ],
+      "ubus": {
+        "file": [
+          "exec"
+        ]
+      },
+      "file": {
+        "/usr/libexec/campus-share invite": [
+          "exec"
+        ],
+        "/usr/libexec/campus-share release *": [
+          "exec"
+        ],
+        "/usr/libexec/campus-share discover": [
+          "exec"
+        ]
+      }
+    }
+  }
+}

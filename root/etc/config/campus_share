@@ -1,0 +1,17 @@
+config settings 'main'
+	option enabled '1'
+	option policy ''
+	option lan_interface 'lan'
+	option port '8088'
+	option pending_timeout '600'
+	option invite_timeout '1800'
+	option portal_url 'http://6.6.6.6/'
+	option probe_url 'http://www.msftconnecttest.com/connecttest.txt'
+	option probe_body 'Microsoft Connect Test'
+
+# Add slot sections in LuCI. Existing interfaces are never selected implicitly.
+# config slot 'spare1'
+#	option enabled '1'
+#	option interface 'your_unused_dhcp_interface'
+#	option table '201'
+#	option label 'Spare uplink'
