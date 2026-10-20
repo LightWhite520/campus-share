@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 const root = path.resolve(import.meta.dirname, '..');
-const view = fs.readFileSync(path.join(root, 'htdocs/luci-static/resources/view/campus-share/overview.js'), 'utf8');
+const view = fs.readFileSync(path.join(root, 'htdocs/luci-static/resources/view/campus-share/manage.js'), 'utf8');
 new Function(view);
 const page = fs.readFileSync(path.join(root, 'root/www-campus-share/index.html'), 'utf8');
 for (const match of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(match[1]);

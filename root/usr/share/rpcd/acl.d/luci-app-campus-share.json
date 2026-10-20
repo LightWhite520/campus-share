@@ -36,6 +36,9 @@
         ],
         "/usr/libexec/campus-share discover": [
           "exec"
+        ],
+        "/usr/libexec/campus-share prepare *": [
+          "exec"
         ]
       }
     }

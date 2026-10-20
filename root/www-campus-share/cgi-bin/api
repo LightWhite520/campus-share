@@ -13,10 +13,26 @@ case "$HTTP_HOST" in *[!a-zA-Z0-9.:-]*|'') fail invalid_host;; esac
 . /usr/share/libubox/jshn.sh
 data="$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)"
 json_load "$data" || fail invalid_json
-json_get_var token token; json_get_var action action
+json_get_var token token; json_get_var action action; json_get_var device_type device_type
+if [ "$action" = login ]; then
+	json_get_var username username; json_get_var password password
+fi
+data=''
+# Browser hints only decide whether a DHCP lease name is appropriate. They are
+# not authentication evidence and do not change the upstream portal's User-Agent.
+case "$HTTP_USER_AGENT" in
+	*Android*|*iPhone*|*iPad*|*iPod*|*Windows\ Phone*|*Mobile*) detected_device_type=phone;;
+	*Windows\ NT*|*Macintosh*|*X11*|*CrOS*) detected_device_type=pc;;
+	*) detected_device_type=unknown;;
+esac
 json_init
 json_add_string token "$token"
 json_add_string action "$action"
+json_add_string device_type "$device_type"
+json_add_string detected_device_type "$detected_device_type"
+if [ "$action" = login ]; then
+	json_add_string username "$username"; json_add_string password "$password"
+fi
 # Ignore any client-provided source address.
 json_add_string client "$REMOTE_ADDR"
 json_dump | /usr/libexec/campus-share request

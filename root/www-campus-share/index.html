@@ -8,37 +8,59 @@ main{width:min(440px,calc(100% - 64px));background:#182438;border:1px solid #304
 small{color:#9eb0c9}h1{font-size:26px;margin:12px 0 20px}p{line-height:1.7;color:#bdcbe0}
 button,a.action{display:block;box-sizing:border-box;width:100%;padding:14px;border:0;border-radius:10px;background:#7ae0bd;color:#092b23;text-align:center;font-size:16px;font-weight:650;text-decoration:none;cursor:pointer;margin:14px 0}
 button:disabled{opacity:.5;cursor:wait}.status{padding:14px;border-radius:10px;background:#0e192a;line-height:1.7}
+label{display:block;margin:18px 0 8px}select,input{box-sizing:border-box;width:100%;padding:12px;border:1px solid #52657f;border-radius:10px;background:#0e192a;color:#e7edf6;font:inherit}#identity{overflow-wrap:anywhere}
 [hidden]{display:none!important}
 </style>
 <main><small>校园网共享 · 自助接入</small><h1>把你的带宽加入共享</h1>
-<p>领取一个空闲出口，再用自己的校园网账号登录。账号与密码只填写在校园网原认证页面。</p>
+<p>领取一个空闲出口，再用自己的校园网账号登录。认证请求会按你选择的电脑或手机类型发送。</p>
 <div class="status" id="status" role="status">正在检查邀请…</div>
+<div id="device-options" hidden><label for="device-type">认证设备类型</label><select id="device-type"><option value="pc" selected>电脑（默认）</option><option value="phone">手机</option></select>
+<p><small>类型与当前设备一致时优先使用真实设备名称；类型不同或名称不可用时随机生成。</small></p></div>
+<p id="identity" hidden></p>
 <button id="claim" hidden>领取空闲出口</button>
-<a id="portal" class="action" hidden target="_blank" rel="noopener noreferrer">打开校园网认证页</a>
+<form id="login-form" hidden autocomplete="off">
+<label for="username">校园网账号</label><input id="username" name="username" required maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false">
+<label for="password">校园网密码</label><input id="password" name="password" type="password" required maxlength="256" autocomplete="off">
+<p><small>账号密码经路由器临时转发至校园网，仅用于本次认证，不保存。</small></p>
+<button id="login-submit" type="submit">登录并加入共享</button>
+</form>
+<p id="login-result" role="status" hidden></p>
+<a id="portal" class="action" hidden target="_blank" rel="noopener noreferrer">改用原认证页（类型由浏览器决定）</a>
 <p id="hint">请保持连接当前 Wi-Fi，接入过程中暂时关闭手机移动数据和代理。不要在普通浏览器里另开 6.6.6.6 给其他人认证。</p>
 <small>插件只在出口确认可上网后加入共享。领取后未完成认证的出口会自动释放。</small>
 </main>
 <script>
 'use strict';
 const statusNode=document.getElementById('status'), claimButton=document.getElementById('claim'), portal=document.getElementById('portal');
+const deviceOptions=document.getElementById('device-options'), deviceType=document.getElementById('device-type'), identity=document.getElementById('identity');
+const loginForm=document.getElementById('login-form'), loginButton=document.getElementById('login-submit'), username=document.getElementById('username'), password=document.getElementById('password'), loginResult=document.getElementById('login-result');
 const token=new URLSearchParams(location.hash.slice(1)).get('invite')||'';
 const messages={invalid_invite:'邀请链接无效，请向管理员索取新链接。',invite_expired:'邀请已过期，请索取新链接。',invite_used:'这个邀请已被另一台设备使用。',no_free_slot:'暂时没有空闲出口，请联系管理员。',device_already_assigned:'这台设备已分配出口，请使用之前的邀请链接。',device_not_found:'未能识别设备，请确认已连接路由器 Wi-Fi。',owner_mismatch:'请用领取出口时的同一台设备打开。',lan_unavailable:'内网尚未就绪，请稍后再试。',busy:'服务正在处理其他请求，稍后自动重试。'};
-let claimed=false,busy=false,timer;
-async function request(action){
- const response=await fetch('/cgi-bin/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,token}),cache:'no-store'});
+messages.invalid_device_type='请选择电脑或手机后重试。';
+Object.assign(messages,{invalid_credentials:'请填写校园网账号和密码。',login_not_ready:'出口尚未就绪，请稍后重试。',reclaim_required:'此出口由旧版本领取，请释放并重新选择设备类型。',portal_unreachable:'暂时无法连接校园网认证服务，请稍后重试。',unsupported_portal:'该认证页面暂不支持类型转发，请使用原认证页。',portal_interaction_required:'认证要求验证码或其他交互，请使用原认证页。',portal_identity_mismatch:'认证入口与当前出口不一致，请联系管理员检查。',authentication_rejected:'校园网未接受本次登录，请检查账号密码或使用原认证页查看原因。',invalid_portal_response:'校园网返回了无法识别的结果，请稍后重试。'});
+let busy=false,timer;
+async function request(action,extra={}){
+ const response=await fetch('/cgi-bin/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,token,...(action==='claim'?{device_type:deviceType.value}:{}),...extra}),cache:'no-store'});
  const data=await response.json();
  if(!data.ok)throw new Error(messages[data.error]||'接入暂不可用：'+data.error);
  return data;
 }
 function show(data){
  claimButton.hidden=data.phase!=='invitation';
+ deviceOptions.hidden=data.phase!=='invitation';
  portal.hidden=true;
- if(data.phase==='invitation'){statusNode.textContent='邀请有效，可以领取空闲出口。';return;}
- claimed=true;
- if(data.phase==='active'){statusNode.textContent='已认证成功，你的出口正在参与带宽共享。';document.getElementById('hint').textContent='这台设备已固定使用自己的出口。其他设备的流量由路由器分担。';return;}
- const notes={waiting_for_dhcp:'已为你预留出口，正在获取地址…',waiting_for_link:'已预留出口，正在等待网线链路或地址，请联系管理员确认接线。',login_required:'出口已准备好，请打开校园网认证页登录。'};
+ loginForm.hidden=true;
+ identity.hidden=!data.hostname;
+ if(data.hostname){
+  const typeName={pc:'电脑',phone:'手机'}[data.device_type]||'设备';
+  identity.textContent=typeName+' · '+data.hostname+(data.hostname_source==='lease'?'（来自当前设备）':data.hostname_source==='random'?'（随机生成）':'');
+ }
+ if(data.phase==='invitation'){statusNode.textContent='邀请有效，请选择设备类型后领取空闲出口。';return;}
+ if(data.phase==='active'){password.value='';loginResult.hidden=true;statusNode.textContent='已认证成功，你的出口正在参与带宽共享。';document.getElementById('hint').textContent='这台设备已固定使用自己的出口。其他设备的流量由路由器分担。';return;}
+ const notes={waiting_for_dhcp:'已为你预留出口，正在获取地址…',waiting_for_link:'已预留出口，正在等待网线链路或地址，请联系管理员确认接线。',login_required:'出口已准备好，请填写校园网账号密码登录。'};
  statusNode.textContent=notes[data.note]||'正在检查校园网连接…';
  if(data.note==='login_required'){
+  loginForm.hidden=!['pc','phone'].includes(data.device_type);
   try{const url=new URL(data.portal);if(url.protocol==='http:'){portal.href=url.href;portal.hidden=false;}}catch(e){}
  }
 }
@@ -48,9 +70,18 @@ async function update(){
  finally{busy=false;}
 }
 claimButton.onclick=async()=>{
- if(busy)return;busy=true;claimButton.disabled=true;
+ if(busy)return;busy=true;claimButton.disabled=true;deviceType.disabled=true;
  try{show(await request('claim'));}catch(e){statusNode.textContent=e.message;}
- finally{busy=false;claimButton.disabled=false;}
+ finally{busy=false;claimButton.disabled=false;deviceType.disabled=false;}
+};
+loginForm.onsubmit=async(event)=>{
+ event.preventDefault();
+ if(busy)return;
+ busy=true;loginButton.disabled=true;username.disabled=true;password.disabled=true;
+ loginResult.hidden=false;loginResult.textContent='正在按所选设备类型提交认证…';
+ try{await request('login',{username:username.value,password:password.value});loginResult.textContent='登录请求已接受，正在验证出口是否联网…';}
+ catch(e){loginResult.textContent=e.message;}
+ finally{password.value='';busy=false;loginButton.disabled=false;username.disabled=false;password.disabled=false;}
 };
 if(!/^[a-f0-9]{48}$/.test(token)){statusNode.textContent='请使用管理员提供的完整邀请链接。';}
 else{update();timer=setInterval(update,4000);}

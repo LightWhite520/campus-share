@@ -1,0 +1,93 @@
+#!/bin/sh
+# Adapter for the portal.do / PortalJsonAction.do / quickauth.do login flow.
+# Sourced by campus-share after the invitation and LAN owner have been checked.
+portal_encode() {
+	printf '%s' "$1" | hexdump -v -e '/1 "%02x"' | sed 's/../%&/g' | tr a-f A-F
+}
+portal_parameter() {
+	local value
+	value="$(printf '%s' "${AUTH_URL#*\?}" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n1)"
+	# Keep already encoded query values; never interpret them as shell/curl code.
+	case "$value" in *[!a-zA-Z0-9._~%:+-]*) return 1;; esac
+	printf '%s' "$value"
+}
+portal_fetch() {
+	local url="$1"
+	shift
+	# Credentials, when present, reach curl on stdin, never in process arguments.
+	printf 'url = "%s"\n' "$url" | curl -4 --noproxy '*' --interface "$SOURCE" \
+		--user-agent "$AUTH_UA" --connect-timeout 2 --max-time 4 \
+		--max-filesize 262144 --proto '=http' --proto-redir '=http' \
+		--cookie "$AUTH_COOKIES" --cookie-jar "$AUTH_COOKIES" \
+		--silent --fail --config - "$@"
+}
+portal_login() (
+	local assigned discovery effective origin authority query context_query response config
+	local pageid timestamp uuid version serverip passcode secondauth code
+	local userip acname ssid vlan rand
+	# Private, temporary cookies only. No credential or upstream-response files.
+	AUTH_COOKIES=''
+	trap '[ -z "$AUTH_COOKIES" ] || rm -f "$AUTH_COOKIES"' EXIT
+	trap 'exit 1' HUP INT TERM
+	assigned="$(field "$ROOT/invites/$TOKEN.json" slot)"
+	[ -n "$assigned" ] && slot_config "$assigned" || error invalid_slot
+	[ -f "$STATE" ] && [ "$(field "$STATE" owner)" = "$OWNER" ] || error owner_mismatch
+	load_state
+	case "$DEVICE_TYPE" in
+		pc) AUTH_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';;
+		phone) AUTH_UA='Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36';;
+		*) error reclaim_required;;
+	esac
+	[ "$PHASE" = pending ] && [ "$NOTE" = login_required ] || error login_not_ready
+	[ -n "$AUTH_USER" ] && [ "${#AUTH_USER}" -le 128 ] && \
+		[ -n "$AUTH_PASSWORD" ] && [ "${#AUTH_PASSWORD}" -le 256 ] || error invalid_credentials
+	network_flush_cache
+	network_get_ipaddr SOURCE "$IFACE" && valid_ip "$SOURCE" || error login_not_ready
+	AUTH_COOKIES="$(mktemp "$RUN/portal-cookie.XXXXXX")" || error login_unavailable
+	# Discover fresh parameters from this assigned uplink, never a user's pasted URL.
+	AUTH_URL="$(opt main portal_url)"
+	case "$AUTH_URL" in http://*) :;; *) error unsupported_portal;; esac
+	case "$AUTH_URL" in *[\"\\]*|*[[:space:]]*) error unsupported_portal;; esac
+	discovery="$(portal_fetch "$AUTH_URL" --location --max-redirs 3 --write-out '\n%{url_effective}')" || error portal_unreachable
+	effective="$(printf '%s\n' "$discovery" | tail -n1)"
+	case "$effective" in
+		http://*/portal.do\?*) AUTH_URL="$effective";;
+		*)
+			# This portal also redirects using location.replace("...") in HTML.
+			AUTH_URL="$(printf '%s\n' "$discovery" | sed -n 's/.*location\.replace("\([^"]*\)".*/\1/p' | head -n1)"
+			;;
+	esac
+	case "$AUTH_URL" in http://*/portal.do\?*) :;; *) error unsupported_portal;; esac
+	origin="${AUTH_URL%%/portal.do\?*}"; authority="${origin#http://}"
+	printf '%s' "$authority" | grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9.-]*(:[0-9]{1,5})?$' || error unsupported_portal
+	userip="$(portal_parameter wlanuserip)" && acname="$(portal_parameter wlanacname)" && \
+		ssid="$(portal_parameter ssid)" && vlan="$(portal_parameter vlan)" && \
+		rand="$(portal_parameter rand)" || error unsupported_portal
+	# Refuse stale redirects for another uplink instead of authenticating its IP.
+	case "$userip" in "$SOURCE"|"$(portal_encode "$SOURCE")") :;; *) error portal_identity_mismatch;; esac
+	[ -n "$acname" ] || error unsupported_portal
+	query="wlanuserip=$(portal_encode "$SOURCE")&wlanacname=$acname&ssid=$ssid&vlan=$vlan&mac=$(portal_encode "$GENERATED_MAC")&hostname=$(portal_encode "$CLIENT_HOSTNAME")"
+	context_query="$query&rand=$rand&url=$(portal_encode "$(opt main portal_url)")"
+	# Load the page with the selected UA too, preserving any portal cookies.
+	AUTH_REFERER="$origin/portal.do?$context_query"
+	portal_fetch "$AUTH_REFERER" >/dev/null || error portal_unreachable
+	config="$(portal_fetch "$origin/PortalJsonAction.do?$context_query&viewStatus=1" --referer "$AUTH_REFERER")" || error portal_unreachable
+	json_load "$config" && json_select portalconfig || error unsupported_portal
+	json_get_var pageid id; json_get_var timestamp timestamp; json_get_var uuid uuid
+	json_get_var passcode listpasscode; json_get_var secondauth list2Auth
+	[ "$passcode" = 0 ] && [ "$secondauth" = 0 ] || error portal_interaction_required
+	[ -n "$pageid" ] && [ -n "$timestamp" ] && [ -n "$uuid" ] || error unsupported_portal
+	json_select ..; json_select serverForm || error unsupported_portal
+	json_get_var version portalVer; json_get_var serverip serverip
+	[ -n "$version" ] && [ -n "$serverip" ] || error unsupported_portal
+	query="$query&wlanacIp=$(portal_encode "$serverip")&wlanuseripv6=&version=$(portal_encode "$version")&portalpageid=$(portal_encode "$pageid")&timestamp=$(portal_encode "$timestamp")&uuid=$(portal_encode "$uuid")&portaltype=1&validateCode="
+	query="$query&userid=$(portal_encode "$AUTH_USER")&passwd=$(portal_encode "$AUTH_PASSWORD")"
+	response="$(portal_fetch "$origin/quickauth.do?$query" --referer "$AUTH_REFERER" --header 'X-Requested-With: XMLHttpRequest')" || error portal_unreachable
+	AUTH_USER=''; AUTH_PASSWORD=''; query=''
+	json_load "$response" || error invalid_portal_response
+	json_get_var code code
+	# Do not echo upstream messages: they can contain account and device details.
+	[ "$code" = 0 ] || error authentication_rejected
+	# The regular HTTP probe, not a login response, decides when to share bandwidth.
+	ok
+)

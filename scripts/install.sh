@@ -16,7 +16,7 @@ done
 [ -z "$(uci changes)" ] || { echo 'Uncommitted UCI edits exist; install stopped'; exit 1; }
 cp -R "$BASE/root/usr/." /usr/
 mkdir -p /www/luci-static/resources/view/campus-share
-cp "$BASE/htdocs/luci-static/resources/view/campus-share/overview.js" /www/luci-static/resources/view/campus-share/
+cp "$BASE/htdocs/luci-static/resources/view/campus-share/manage.js" /www/luci-static/resources/view/campus-share/
 cp -R "$BASE/root/www-campus-share" /www-campus-share
 cp "$BASE/root/etc/init.d/campus-share" /etc/init.d/campus-share
 [ -f /etc/config/campus_share ] || cp "$BASE/root/etc/config/campus_share" /etc/config/campus_share

@@ -27,7 +27,7 @@ return view.extend({
 		});
 		var rows = E('div', { 'class': 'cbi-section' });
 		var invite = E('input', { 'readonly': true, 'style': 'width:100%', 'placeholder': '点击生成邀请链接' });
-		var notice = E('p', {}, '生成邀请后，舍友领取空闲出口，在校园网原页面认证。密码不会经过本插件。');
+		var notice = E('p', {}, '生成邀请后，舍友选择电脑或手机并领取出口。登录请求按所选类型转发，账号密码仅用于本次认证、不保存；出口 MAC 使用下方选定的模式。');
 		function notify(e) { ui.addNotification(null, E('p', {}, e.message), 'error'); }
 		function refresh() {
 			return command(['status']).then(function(status) {
@@ -64,6 +64,10 @@ return view.extend({
 		var m = new form.Map('campus_share', '校园网共享',
 			'接口来自当前网络配置。只有明确加入分配池、关闭自动启动且未被其他负载均衡成员引用的 DHCP 接口才会分配。');
 		var s = m.section(form.NamedSection, 'main', 'settings', '共享设置'), o;
+		o = s.option(form.ListValue, 'mac_mode', '出口 MAC 模式', '仅影响新领取的出口。已领取的出口需释放后重新领取才切换模式。');
+		o.value('random', '随机 MAC（默认）');
+		o.value('client', '认证客户端 MAC');
+		o.default = 'random'; o.rmempty = false;
 		o = s.option(form.ListValue, 'policy', '加入的负载均衡策略');
 		o.value('', '请选择');
 		uci.sections('mwan3', 'policy', function(p) { o.value(p['.name']); });
@@ -103,6 +107,19 @@ return view.extend({
 				o.value(n['.name'], n['.name'] + ' (' + n.device + ')');
 			}
 		});
+		var convertSelect = E('select', { 'class': 'cbi-input-select' },
+			choices.map(function(n) { return E('option', { value: n['.name'] }, n['.name'] + ' (' + n.device + ')'); }));
+		var convertButton = E('button', { 'class': 'btn cbi-button-action', 'click': function() {
+			var target = convertSelect.value;
+			if (!target) return;
+			ui.showModal('转为共享出口', [
+				E('p', {}, '将 ' + target + ' 停用，移除它在所有负载均衡策略中的原成员关系，并导入分配池。经过这条线路的连接会中断；领取后会按共享设置更换出口身份。配置会先备份，释放时不会恢复原负载均衡用途。'),
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, '取消'),
+				E('button', { 'class': 'btn cbi-button-negative', 'click': function() {
+					command(['prepare', target]).then(function() { ui.hideModal(); window.location.reload(); }).catch(notify);
+				}}, '确认转换')
+			]);
+		}}, '转为共享出口');
 		o.validate = function(id, value) {
 			if (occupied[id] && occupied[id].interface !== value) return '请先释放这个出口';
 			var chosen = choices.find(function(n) { return n['.name'] === value; });
@@ -127,6 +144,11 @@ return view.extend({
 			return E('div', {}, [
 				E('h2', {}, '校园网共享'), notice,
 				E('p', {}, '当前共享出口不会自动进入分配池。增加虚拟出口也不会突破物理端口的总带宽。'),
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, '转为共享出口'),
+					E('p', {}, 'WAN、LAN2 等原有 DHCP 上联也可转换。请先保存页面配置；转换后接口保持停用，等待设备领取。'),
+					convertSelect, convertButton
+				]),
 				rows,
 				E('div', { 'class': 'cbi-section' }, [
 					E('button', { 'class': 'btn', 'click': function() {
